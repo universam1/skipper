@@ -2,17 +2,139 @@ package net
 
 import (
 	"crypto/tls"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
 	defaultIdleConnTimeout = 30 * time.Second
+	defaultRefreshInterval = 5 * time.Minute
 )
+
+type Client struct {
+	client http.Client
+	// bearer the token that is read regularly from file
+	bearer string
+	quit   chan struct{}
+}
+
+func NewClient(o Options) *Client {
+	quit := make(chan struct{})
+
+	o.omitCloseIdleLoop = true // we do this in the client to omit having 2 goroutines
+	tr := NewTransport(o)
+
+	c := &Client{
+		quit: quit,
+		client: http.Client{
+			Transport: tr,
+		},
+	}
+
+	go func() {
+		var updateToken func()
+
+		refreshInterval := o.BearerTokenRefreshInterval
+		if o.BearerTokenFile != "" {
+			if refreshInterval < 1*time.Second {
+				refreshInterval = defaultRefreshInterval
+			}
+
+			updateToken = func() {
+				dat, err := ioutil.ReadFile(o.BearerTokenFile)
+				if err != nil {
+					log.Errorf("Failed to read bearer token file: %v", err)
+				}
+				if len(dat) > 0 {
+					c.bearer = string(dat)
+				}
+				println("updateToken:", c.bearer)
+			}
+			updateToken()
+		}
+
+		d := refreshInterval
+		for {
+
+			if o.BearerTokenFile != "" {
+				select {
+				case <-time.After(d):
+					updateToken()
+					d = refreshInterval
+				case <-time.After(o.IdleConnTimeout):
+					tr.CloseIdleConnections()
+					d -= o.IdleConnTimeout
+				case <-quit:
+					return
+				}
+			} else {
+				select {
+				case <-time.After(o.IdleConnTimeout):
+					tr.CloseIdleConnections()
+				case <-quit:
+					return
+				}
+			}
+		}
+	}()
+
+	return c
+}
+
+func (c *Client) Close() {
+	close(c.quit)
+}
+
+func (c *Client) Head(url string) (*http.Response, error) {
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.client.Do(req)
+}
+
+func (c *Client) Get(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.client.Do(req)
+}
+
+func (c *Client) Post(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	return c.client.Do(req)
+}
+
+func (c *Client) PostForm(url string, data url.Values) (*http.Response, error) {
+	return c.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
+}
+
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	if c.bearer != "" && req.Header.Get("Authorization") == "" {
+		req.Header.Set("Authorization", c.bearer)
+	}
+	return c.client.Do(req)
+}
+
+func (c *Client) CloseIdleConnections() {
+	c.client.CloseIdleConnections()
+}
 
 // Options are mostly passed to the http.Transport of the same
 // name. Options.Timeout can be used as default for all timeouts, that
@@ -61,6 +183,18 @@ type Options struct {
 	ExpectContinueTimeout time.Duration
 	// Tracer instance, can be nil to not enable tracing
 	Tracer opentracing.Tracer
+
+	// BearerTokenFile injects bearer token read from file, which file path is the given string
+	BearerTokenFile string
+	// BearerTokenRefreshInterval refresh bearer from BearerTokenFile
+	BearerTokenRefreshInterval time.Duration
+
+	// OpentracingComponentTag sets component tag for all requests
+	OpentracingComponentTag string
+	// OpentracingSpanName sets span name for all requests
+	OpentracingSpanName string
+
+	omitCloseIdleLoop bool
 }
 
 // Transport wraps an http.Transport and adds support for tracing and
@@ -124,16 +258,27 @@ func NewTransport(options Options) *Transport {
 		tracer: options.Tracer,
 	}
 
-	go func() {
-		for {
-			select {
-			case <-time.After(options.IdleConnTimeout):
-				htransport.CloseIdleConnections()
-			case <-t.quit:
-				return
-			}
+	if t.tracer != nil {
+		if options.OpentracingComponentTag != "" {
+			t = WithComponentTag(t, options.OpentracingComponentTag)
 		}
-	}()
+		if options.OpentracingSpanName != "" {
+			t = WithSpanName(t, options.OpentracingSpanName)
+		}
+	}
+
+	if !options.omitCloseIdleLoop {
+		go func() {
+			for {
+				select {
+				case <-time.After(options.IdleConnTimeout):
+					htransport.CloseIdleConnections()
+				case <-t.quit:
+					return
+				}
+			}
+		}()
+	}
 
 	return t
 }
@@ -170,7 +315,11 @@ func (t *Transport) shallowCopy() *Transport {
 }
 
 func (t *Transport) Close() {
-	t.quit <- struct{}{}
+	close(t.quit)
+}
+
+func (t *Transport) CloseIdleConnections() {
+	t.tr.CloseIdleConnections()
 }
 
 // RoundTrip the request with tracing, bearer token injection and add client
