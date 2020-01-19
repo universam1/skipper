@@ -3,10 +3,12 @@ package net_test
 import (
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"time"
 
 	"github.com/lightstep/lightstep-tracer-go"
 	"github.com/zalando/skipper/net"
+	"github.com/zalando/skipper/secrets"
 )
 
 func ExampleTransport() {
@@ -19,7 +21,16 @@ func ExampleTransport() {
 	cli = net.WithSpanName(cli, "myspan")
 	cli = net.WithBearerToken(cli, "mytoken")
 
-	u := "http://127.0.0.1:12345/foo"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("Authorization: %s", r.Header.Get("Authorization"))
+		log.Printf("Ot-Tracer-Sampled: %s", r.Header.Get("Ot-Tracer-Sampled"))
+		log.Printf("Ot-Tracer-Traceid: %s", r.Header.Get("Ot-Tracer-Traceid"))
+		log.Printf("Ot-Tracer-Spanid: %s", r.Header.Get("Ot-Tracer-Spanid"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	u := "http://" + srv.Listener.Addr().String() + "/"
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		log.Fatalf("Failed to create request: %v", err)
@@ -49,7 +60,58 @@ func ExampleClient() {
 		println("stopped")
 	}()
 
-	u := "http://127.0.0.1:12345/foo"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("Authorization: %s", r.Header.Get("Authorization"))
+		log.Printf("Ot-Tracer-Sampled: %s", r.Header.Get("Ot-Tracer-Sampled"))
+		log.Printf("Ot-Tracer-Traceid: %s", r.Header.Get("Ot-Tracer-Traceid"))
+		log.Printf("Ot-Tracer-Spanid: %s", r.Header.Get("Ot-Tracer-Spanid"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	u := "http://" + srv.Listener.Addr().String() + "/"
+
+	for i := 0; i < 15; i++ {
+		rsp, err := cli.Get(u)
+		if err != nil {
+			log.Fatalf("Failed to do request: %v", err)
+		}
+		log.Printf("rsp code: %v", rsp.StatusCode)
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func ExampleClient_secretsReader() {
+	tracer := lightstep.NewTracer(lightstep.Options{})
+
+	sp := secrets.NewSecretPaths(10 * time.Second)
+	if err := sp.Add("/tmp/bar.token"); err != nil {
+		log.Fatalf("failed to read secret: %v", err)
+	}
+
+	cli := net.NewClient(net.Options{
+		Tracer:                  tracer,
+		OpentracingComponentTag: "testclient",
+		OpentracingSpanName:     "clientSpan",
+		SecretsReader:           sp,
+		IdleConnTimeout:         2 * time.Second,
+	})
+	defer func() {
+		println("closing...")
+		cli.Close()
+		println("stopped")
+	}()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("Authorization: %s", r.Header.Get("Authorization"))
+		log.Printf("Ot-Tracer-Sampled: %s", r.Header.Get("Ot-Tracer-Sampled"))
+		log.Printf("Ot-Tracer-Traceid: %s", r.Header.Get("Ot-Tracer-Traceid"))
+		log.Printf("Ot-Tracer-Spanid: %s", r.Header.Get("Ot-Tracer-Spanid"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	u := "http://" + srv.Listener.Addr().String() + "/"
 
 	for i := 0; i < 15; i++ {
 		rsp, err := cli.Get(u)

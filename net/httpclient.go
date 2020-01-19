@@ -3,7 +3,6 @@ package net
 import (
 	"crypto/tls"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 	log "github.com/sirupsen/logrus"
+	"github.com/zalando/skipper/secrets"
 )
 
 const (
@@ -21,71 +21,34 @@ const (
 )
 
 type Client struct {
-	client http.Client
-	// bearer the token that is read regularly from file
-	bearer string
-	quit   chan struct{}
+	client      http.Client
+	sr          secrets.SecretsReader
+	secretsPath string
+	quit        chan struct{}
 }
 
 func NewClient(o Options) *Client {
 	quit := make(chan struct{})
 
-	o.omitCloseIdleLoop = true // we do this in the client to omit having 2 goroutines
 	tr := NewTransport(o)
+
+	sr := o.SecretsReader
+	if sr == nil {
+		sp := secrets.NewSecretPaths(o.BearerTokenRefreshInterval)
+		if err := sp.Add(o.BearerTokenFile); err != nil {
+			log.Errorf("failed to read secret: %v", err)
+		}
+		sr = sp
+	}
 
 	c := &Client{
 		quit: quit,
 		client: http.Client{
 			Transport: tr,
 		},
+		sr:          sr,
+		secretsPath: o.BearerTokenFile,
 	}
-
-	go func() {
-		var updateToken func()
-
-		refreshInterval := o.BearerTokenRefreshInterval
-		if o.BearerTokenFile != "" {
-			if refreshInterval < 1*time.Second {
-				refreshInterval = defaultRefreshInterval
-			}
-
-			updateToken = func() {
-				dat, err := ioutil.ReadFile(o.BearerTokenFile)
-				if err != nil {
-					log.Errorf("Failed to read bearer token file: %v", err)
-				}
-				if len(dat) > 0 {
-					c.bearer = string(dat)
-				}
-				println("updateToken:", c.bearer)
-			}
-			updateToken()
-		}
-
-		d := refreshInterval
-		for {
-
-			if o.BearerTokenFile != "" {
-				select {
-				case <-time.After(d):
-					updateToken()
-					d = refreshInterval
-				case <-time.After(o.IdleConnTimeout):
-					tr.CloseIdleConnections()
-					d -= o.IdleConnTimeout
-				case <-quit:
-					return
-				}
-			} else {
-				select {
-				case <-time.After(o.IdleConnTimeout):
-					tr.CloseIdleConnections()
-				case <-quit:
-					return
-				}
-			}
-		}
-	}()
 
 	return c
 }
@@ -100,7 +63,7 @@ func (c *Client) Head(url string) (*http.Response, error) {
 		return nil, err
 	}
 
-	return c.client.Do(req)
+	return c.Do(req)
 }
 
 func (c *Client) Get(url string) (*http.Response, error) {
@@ -108,7 +71,7 @@ func (c *Client) Get(url string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.client.Do(req)
+	return c.Do(req)
 }
 
 func (c *Client) Post(url, contentType string, body io.Reader) (*http.Response, error) {
@@ -118,7 +81,7 @@ func (c *Client) Post(url, contentType string, body io.Reader) (*http.Response, 
 	}
 	req.Header.Set("Content-Type", contentType)
 
-	return c.client.Do(req)
+	return c.Do(req)
 }
 
 func (c *Client) PostForm(url string, data url.Values) (*http.Response, error) {
@@ -126,8 +89,10 @@ func (c *Client) PostForm(url string, data url.Values) (*http.Response, error) {
 }
 
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	if c.bearer != "" && req.Header.Get("Authorization") == "" {
-		req.Header.Set("Authorization", c.bearer)
+	if c.sr != nil && req.Header.Get("Authorization") == "" {
+		if b, ok := c.sr.GetSecret(c.secretsPath); ok {
+			req.Header.Set("Authorization", "Bearer "+string(b))
+		}
 	}
 	return c.client.Do(req)
 }
@@ -189,12 +154,12 @@ type Options struct {
 	// BearerTokenRefreshInterval refresh bearer from BearerTokenFile
 	BearerTokenRefreshInterval time.Duration
 
+	SecretsReader secrets.SecretsReader
+
 	// OpentracingComponentTag sets component tag for all requests
 	OpentracingComponentTag string
 	// OpentracingSpanName sets span name for all requests
 	OpentracingSpanName string
-
-	omitCloseIdleLoop bool
 }
 
 // Transport wraps an http.Transport and adds support for tracing and
@@ -267,18 +232,16 @@ func NewTransport(options Options) *Transport {
 		}
 	}
 
-	if !options.omitCloseIdleLoop {
-		go func() {
-			for {
-				select {
-				case <-time.After(options.IdleConnTimeout):
-					htransport.CloseIdleConnections()
-				case <-t.quit:
-					return
-				}
+	go func() {
+		for {
+			select {
+			case <-time.After(options.IdleConnTimeout):
+				htransport.CloseIdleConnections()
+			case <-t.quit:
+				return
 			}
-		}()
-	}
+		}
+	}()
 
 	return t
 }
