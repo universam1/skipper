@@ -11,7 +11,8 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	"github.com/zalando/skipper/logging"
 	"github.com/zalando/skipper/secrets"
 )
 
@@ -22,6 +23,7 @@ const (
 
 type Client struct {
 	client      http.Client
+	log         logging.Logger
 	sr          secrets.SecretsReader
 	secretsPath string
 	quit        chan struct{}
@@ -29,25 +31,32 @@ type Client struct {
 
 func NewClient(o Options) *Client {
 	quit := make(chan struct{})
+	if o.Log == nil {
+		o.Log = logrus.New()
+	}
 
 	tr := NewTransport(o)
 
 	sr := o.SecretsReader
 	if sr == nil {
+		if o.BearerTokenRefreshInterval == 0 {
+			o.BearerTokenRefreshInterval = defaultRefreshInterval
+		}
 		sp := secrets.NewSecretPaths(o.BearerTokenRefreshInterval)
 		if err := sp.Add(o.BearerTokenFile); err != nil {
-			log.Errorf("failed to read secret: %v", err)
+			o.Log.Errorf("failed to read secret: %v", err)
 		}
 		sr = sp
 	}
 
 	c := &Client{
-		quit: quit,
 		client: http.Client{
 			Transport: tr,
 		},
+		log:         o.Log,
 		sr:          sr,
 		secretsPath: o.BearerTokenFile,
+		quit:        quit,
 	}
 
 	return c
@@ -153,8 +162,11 @@ type Options struct {
 	BearerTokenFile string
 	// BearerTokenRefreshInterval refresh bearer from BearerTokenFile
 	BearerTokenRefreshInterval time.Duration
-
+	// SecretsReader is used to read and refresh bearer tokens
 	SecretsReader secrets.SecretsReader
+
+	// Log is used for error logging
+	Log logging.Logger
 
 	// OpentracingComponentTag sets component tag for all requests
 	OpentracingComponentTag string
