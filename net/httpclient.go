@@ -21,14 +21,66 @@ const (
 	defaultRefreshInterval = 5 * time.Minute
 )
 
-type Client struct {
-	client      http.Client
-	log         logging.Logger
-	sr          secrets.SecretsReader
-	secretsPath string
-	quit        chan struct{}
+// Lookuper is an indirection and used to map calls to
+// secrets.SecretsReader's GetSecret to the right parameter.
+type Lookuper interface {
+	// Lookup maps an URL string to the parameter passed into
+	// SecretsReader.GetSecret().
+	Lookup(*url.URL) string
 }
 
+// SingleStaticSecretLookuper stores the string to statically lookup
+type SingleStaticSecretLookuper string
+
+// NewSingleStaticSecretLookuper creates a SingleStaticSecretLookuper
+// that lookups always to the given s.
+func NewSingleStaticSecretLookuper(s string) SingleStaticSecretLookuper {
+	return SingleStaticSecretLookuper(s)
+}
+
+// Lookup returns the string value of SingleStaticSecretLookuper
+func (l SingleStaticSecretLookuper) Lookup(*url.URL) string {
+	return string(l)
+}
+
+// HostLookuper can be used to configure by host secrets.
+type HostLookuper struct {
+	secMap map[string]string
+}
+
+// NewHostLookup returns a dynamic HostLookuper, which use h as host
+// lookup backend.
+func NewHostLookup(h map[string]string) *HostLookuper {
+	hl := HostLookuper{
+		secMap: h,
+	}
+	if h == nil {
+		hl.secMap = make(map[string]string)
+	}
+	return &hl
+}
+
+// Lookup path by hostname of the given URL.
+func (hl *HostLookuper) Lookup(u *url.URL) string {
+	h, _ := hl.secMap[u.Hostname()]
+	return h
+}
+
+// Client adds additional features like Bearer token injection, and
+// opentracing to the wrapped http.Client with the same interface as
+// http.Client from the stdlib.
+type Client struct {
+	client http.Client
+	tr     *Transport
+	log    logging.Logger
+	sr     secrets.SecretsReader
+	l      Lookuper
+	quit   chan struct{}
+}
+
+// NewClient creates a wrapped http.Client and uses Transport to
+// support OpenTracing. On teardown you have to use Close() to
+// not leak a goroutine.
 func NewClient(o Options) *Client {
 	quit := make(chan struct{})
 	if o.Log == nil {
@@ -38,7 +90,7 @@ func NewClient(o Options) *Client {
 	tr := NewTransport(o)
 
 	sr := o.SecretsReader
-	if sr == nil {
+	if sr == nil && o.BearerTokenFile != "" {
 		if o.BearerTokenRefreshInterval == 0 {
 			o.BearerTokenRefreshInterval = defaultRefreshInterval
 		}
@@ -48,22 +100,29 @@ func NewClient(o Options) *Client {
 		}
 		sr = sp
 	}
+	if o.Lookuper == nil && o.BearerTokenFile != "" {
+		o.Lookuper = NewSingleStaticSecretLookuper(o.BearerTokenFile)
+	}
 
 	c := &Client{
 		client: http.Client{
 			Transport: tr,
 		},
-		log:         o.Log,
-		sr:          sr,
-		secretsPath: o.BearerTokenFile,
-		quit:        quit,
+		tr:   tr,
+		log:  o.Log,
+		sr:   sr,
+		l:    o.Lookuper,
+		quit: quit,
 	}
 
 	return c
 }
 
 func (c *Client) Close() {
-	close(c.quit)
+	c.tr.Close()
+	if c.sr != nil {
+		c.sr.Close()
+	}
 }
 
 func (c *Client) Head(url string) (*http.Response, error) {
@@ -99,7 +158,7 @@ func (c *Client) PostForm(url string, data url.Values) (*http.Response, error) {
 
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if c.sr != nil && req.Header.Get("Authorization") == "" {
-		if b, ok := c.sr.GetSecret(c.secretsPath); ok {
+		if b, ok := c.sr.GetSecret(c.l.Lookup(req.URL)); ok {
 			req.Header.Set("Authorization", "Bearer "+string(b))
 		}
 	}
@@ -158,12 +217,21 @@ type Options struct {
 	// Tracer instance, can be nil to not enable tracing
 	Tracer opentracing.Tracer
 
-	// BearerTokenFile injects bearer token read from file, which file path is the given string
+	// BearerTokenFile injects bearer token read from file, which
+	// file path is the given string. In case SecretsReader is
+	// provided, BearerTokenFile will be ignored.
 	BearerTokenFile string
-	// BearerTokenRefreshInterval refresh bearer from BearerTokenFile
+	// BearerTokenRefreshInterval refresh bearer from
+	// BearerTokenFile. In case SecretsReader is provided,
+	// BearerTokenFile will be ignored.
 	BearerTokenRefreshInterval time.Duration
 	// SecretsReader is used to read and refresh bearer tokens
 	SecretsReader secrets.SecretsReader
+	// Lookuper is used to lookup the parameter for
+	// SecretsReader.GetSecret(), if nil
+	// SingleStaticSecretLookuper is used to return always
+	// BearerTokenFile.
+	Lookuper Lookuper
 
 	// Log is used for error logging
 	Log logging.Logger

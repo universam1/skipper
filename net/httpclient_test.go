@@ -4,12 +4,22 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/zalando/skipper/tracing/tracers/basic"
 )
+
+const testToken = "mytoken1"
+
+type testSecretsReader struct{}
+
+func (testSecretsReader) Close() {}
+func (testSecretsReader) GetSecret(string) ([]byte, bool) {
+	return []byte(testToken), true
+}
 
 func TestClient(t *testing.T) {
 	tracer, err := basic.InitTracer([]string{"recorder=in-memory"})
@@ -49,10 +59,24 @@ func TestClient(t *testing.T) {
 			tokenFile: "token",
 			wantErr:   false,
 		},
+		{
+			name: "With secrets reader and lookuper",
+			options: Options{
+				Lookuper:      NewSingleStaticSecretLookuper(testToken),
+				SecretsReader: testSecretsReader{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "With secrets reader and wrong lookuper",
+			options: Options{
+				Lookuper:      NewSingleStaticSecretLookuper("wrong"),
+				SecretsReader: testSecretsReader{},
+			},
+			wantErr: true,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			tok := "mytoken1"
-
 			s := startTestServer(func(r *http.Request) {
 				if tt.options.OpentracingSpanName != "" && tt.options.Tracer != nil {
 					if r.Header.Get("Ot-Tracer-Sampled") == "" ||
@@ -62,13 +86,17 @@ func TestClient(t *testing.T) {
 					}
 				}
 
-				if tt.tokenFile != "" {
+				if tt.tokenFile != "" || tt.options.SecretsReader != nil {
 					switch auth := r.Header.Get("Authorization"); auth {
-					case "Bearer " + tok:
+					case "Bearer " + testToken:
 						// success
 					default:
-						t.Errorf("Wrong Authorization header '%s'", auth)
+						if !tt.wantErr {
+							t.Errorf("Wrong Authorization header '%s'", auth)
+						}
 					}
+				} else if r.Header.Get("Authorization") != "" {
+					t.Errorf("Client should not have an authorization header: %s", r.Header.Get("Authorization"))
 				}
 			})
 			defer s.Close()
@@ -80,7 +108,7 @@ func TestClient(t *testing.T) {
 				}
 				defer os.RemoveAll(dir) // clean up
 				tokenFile := filepath.Join(dir, tt.tokenFile)
-				if err := ioutil.WriteFile(tokenFile, []byte(tok), 0600); err != nil {
+				if err := ioutil.WriteFile(tokenFile, []byte(testToken), 0600); err != nil {
 					t.Fatalf("Failed to create token file: %v", err)
 				}
 				tt.options.BearerTokenFile = tokenFile
@@ -92,10 +120,36 @@ func TestClient(t *testing.T) {
 			u := "http://" + s.Listener.Addr().String() + "/"
 
 			_, err = cli.Get(u)
-			if (err != nil) != tt.wantErr {
+			if err != nil {
 				t.Errorf("Failed to do GET request error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
+			_, err = cli.Head(u)
+			if err != nil {
+				t.Errorf("Failed to do HEAD request error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			_, err = cli.Post(u, "", nil)
+			if err != nil {
+				t.Errorf("Failed to do POST request error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			_, err = cli.PostForm(u, url.Values{})
+			if err != nil {
+				t.Errorf("Failed to do POST form request error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			req, err := http.NewRequest("DELETE", u, nil)
+			if err != nil {
+				t.Errorf("Failed to create DELETE request: %v", err)
+			}
+			_, err = cli.Do(req)
+			if err != nil {
+				t.Errorf("Failed to do DELETE request error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
 		})
 	}
 }
@@ -130,7 +184,7 @@ func TestTransport(t *testing.T) {
 		},
 		{
 			name:        "With bearer token request should have a token in the request observed by the endpoint",
-			bearerToken: "my-token",
+			bearerToken: testToken,
 			req:         httptest.NewRequest("GET", "http://example.com/", nil),
 			wantErr:     false,
 		},
@@ -154,7 +208,7 @@ func TestTransport(t *testing.T) {
 				}
 
 				if tt.bearerToken != "" {
-					if r.Header.Get("Authorization") != "Bearer my-token" {
+					if r.Header.Get("Authorization") != "Bearer "+testToken {
 						t.Errorf("Failed to have a token, but want to have it, got: %v, want: %v", r.Header.Get("Authorization"), "Bearer "+tt.bearerToken)
 					}
 				}

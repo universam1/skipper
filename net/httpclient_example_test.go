@@ -54,11 +54,7 @@ func ExampleClient() {
 		BearerTokenFile:            "/tmp/foo.token",
 		IdleConnTimeout:            2 * time.Second,
 	})
-	defer func() {
-		println("closing...")
-		cli.Close()
-		println("stopped")
-	}()
+	defer cli.Close()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Authorization: %s", r.Header.Get("Authorization"))
@@ -96,11 +92,7 @@ func ExampleClient_secretsReader() {
 		SecretsReader:           sp,
 		IdleConnTimeout:         2 * time.Second,
 	})
-	defer func() {
-		println("closing...")
-		cli.Close()
-		println("stopped")
-	}()
+	defer cli.Close()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Authorization: %s", r.Header.Get("Authorization"))

@@ -26,6 +26,11 @@ var (
 type SecretsReader interface {
 	// GetSecret finds secret by name and returns secret and if found or not
 	GetSecret(string) ([]byte, bool)
+	// Close should be used on teardown to cleanup a refresher
+	// goroutine. Implementers should check of this interface
+	// should check nil pointer, such that caller do not need to
+	// check.
+	Close()
 }
 
 // SecretsProvider is a SecretsReader and can add secret sources that
@@ -192,5 +197,7 @@ func (sp *SecretPaths) runRefresher() {
 }
 
 func (sp *SecretPaths) Close() {
-	close(sp.quit)
+	if sp != nil {
+		close(sp.quit)
+	}
 }
