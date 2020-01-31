@@ -1,6 +1,10 @@
 package auth
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
@@ -216,12 +220,13 @@ func createOIDCServer(cb, client, clientsecret string) *httptest.Server {
 				w.Header().Set("Pragma", "no-cache")
 
 				token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-					testKey: testValue, // claims to check
-					"iss":   oidcServer.URL,
-					"sub":   testSub,
-					"aud":   validClient,
-					"iat":   time.Now().Add(-time.Minute).UTC().Unix(),
-					"exp":   time.Now().Add(time.Hour).UTC().Unix(),
+					testKey:  testValue, // claims to check
+					"iss":    oidcServer.URL,
+					"sub":    testSub,
+					"aud":    validClient,
+					"iat":    time.Now().Add(-time.Minute).UTC().Unix(),
+					"exp":    time.Now().Add(time.Hour).UTC().Unix(),
+					"groups": []string{"group_one", "group_two"},
 				})
 
 				privKey, err := ioutil.ReadFile(keyPath)
@@ -824,5 +829,83 @@ func TestChunkAndMergerCookie(t *testing.T) {
 				}(), "its size should not exceed limits cookieMaxSize")
 			}
 		})
+	}
+}
+
+var merges = []struct {
+	name string
+	fun  cookieCompression
+}{
+	{"zlib/max", &zlibCompressor{compressionLevel: zlib.BestCompression}},
+	{"gzip/max", &gzipCompressor{compressionLevel: gzip.BestCompression}},
+	{"gzip-pool/max", NewgGzipPoolCompressor(gzip.BestCompression)},
+	{"flate/max", &deflateCompressor{compressionLevel: flate.BestCompression}},
+	{"flate-pool/max", NewDeflatePoolCompressor(flate.BestCompression)},
+	{"zlib/default", &zlibCompressor{compressionLevel: zlib.DefaultCompression}},
+	{"gzip-pool/default", NewgGzipPoolCompressor(gzip.DefaultCompression)},
+	{"gzip/default", &gzipCompressor{compressionLevel: gzip.DefaultCompression}},
+	{"flate/default", &deflateCompressor{compressionLevel: flate.DefaultCompression}},
+	{"flate-pool/default", NewDeflatePoolCompressor(flate.DefaultCompression)},
+	{"gzip-pool/min", NewgGzipPoolCompressor(gzip.BestSpeed)},
+	{"zlib/min", &zlibCompressor{compressionLevel: zlib.BestSpeed}},
+	{"gzip/min", &gzipCompressor{compressionLevel: gzip.BestSpeed}},
+	{"flate/min", &deflateCompressor{compressionLevel: flate.BestSpeed}},
+	{"flate-pool/min", NewDeflatePoolCompressor(flate.BestSpeed)},
+}
+
+func BenchmarkCompressSerial(b *testing.B) {
+	data, err := ioutil.ReadFile("bearer")
+	if err != nil {
+		panic(err)
+	}
+	b.ResetTimer()
+	for _, rw := range []string{"comp", "decomp"} {
+		for _, merge := range merges {
+			b.Run(fmt.Sprintf("%s/%s", rw, merge.name), func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					compressed, err := merge.fun.compress(data)
+					if err != nil {
+						b.Error(err)
+					}
+					decomp, err := merge.fun.decompress(compressed)
+					if err != nil {
+						b.Error(err)
+					}
+					b.ReportMetric(float64(len(compressed)), "byte")
+					b.ReportMetric(float64(len(data))/float64(len(compressed)), "ratio")
+					if !bytes.Equal(decomp, data) {
+						b.Error("not equal")
+					}
+				}
+			})
+		}
+	}
+}
+func BenchmarkCompressParallel(b *testing.B) {
+	data, err := ioutil.ReadFile("bearer")
+	if err != nil {
+		panic(err)
+	}
+	b.ResetTimer()
+	for _, rw := range []string{"comp", "decomp"} {
+		for _, merge := range merges {
+			b.Run(fmt.Sprintf("%s/%s", rw, merge.name), func(b *testing.B) {
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						compressed, err := merge.fun.compress(data)
+						if err != nil {
+							b.Error(err)
+						}
+						decomp, err := merge.fun.decompress(compressed)
+						if err != nil {
+							b.Error(err)
+						}
+						if !bytes.Equal(decomp, data) {
+							b.Error("not equal")
+						}
+					}
+				})
+			})
+		}
 	}
 }

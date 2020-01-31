@@ -1,18 +1,25 @@
 package auth
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/lzw"
+	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc"
@@ -51,6 +58,7 @@ type (
 		redirectPath    string
 		encrypter       secrets.Encryption
 		authCodeOptions []oauth2.AuthCodeOption
+		compressor      cookieCompression
 	}
 
 	userInfoContainer struct {
@@ -65,7 +73,233 @@ type (
 		Claims      map[string]interface{} `json:"claims"`
 		Subject     string                 `json:"subject"`
 	}
+
+	cookieCompression interface {
+		compress([]byte) ([]byte, error)
+		decompress([]byte) ([]byte, error)
+	}
+
+	zlibCompressor struct {
+		compressionLevel int
+	}
+	gzipCompressor struct {
+		compressionLevel int
+	}
+	gzipPoolCompressor struct {
+		compressionLevel int
+		poolWriter       *sync.Pool
+	}
+	deflateCompressor struct {
+		compressionLevel int
+	}
+	deflatePoolCompressor struct {
+		compressionLevel int
+		poolWriter       *sync.Pool
+	}
+	lzwCompressor struct {
+		order lzw.Order
+	}
 )
+
+func (gz *gzipCompressor) compress(rawData []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gz.compressionLevel)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to initiate compression of the cookie: %v", err)
+	}
+	_, err = zw.Write(rawData)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %v", err)
+	}
+	err = zw.Close()
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("cookie compressed: %d to %d\n", len(rawData), buf.Len())
+	return buf.Bytes(), nil
+}
+
+func (gz *gzipCompressor) decompress(compData []byte) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		return nil, fmt.Errorf("Initiating the decompression of the cookie failed: %w", err)
+	}
+	err = zr.Close()
+	if err != nil {
+		return nil, err
+	}
+	return ioutil.ReadAll(zr)
+}
+
+func NewgGzipPoolCompressor(level int) *gzipPoolCompressor {
+	gz := &gzipPoolCompressor{compressionLevel: level}
+	gz.poolWriter = &sync.Pool{}
+	gz.poolWriter.New = func() interface{} {
+		w, err := gzip.NewWriterLevel(ioutil.Discard, level)
+		if err != nil {
+			log.Error(err)
+		}
+		return struct {
+			writer *gzip.Writer
+			buf    bytes.Buffer
+		}{
+			writer: w,
+			buf:    bytes.Buffer{},
+		}
+	}
+	return gz
+}
+
+func (gz *gzipPoolCompressor) compress(rawData []byte) ([]byte, error) {
+	pool, ok := gz.poolWriter.Get().(struct {
+		writer *gzip.Writer
+		buf    bytes.Buffer
+	})
+	if !ok || pool.writer == nil {
+		return nil, fmt.Errorf("could not get a gzip.Writer from the pool")
+	}
+	defer gz.poolWriter.Put(pool)
+	pool.buf.Reset()
+	pool.writer.Reset(&pool.buf)
+	_, err := pool.writer.Write(rawData)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %w", err)
+	}
+	err = pool.writer.Close()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %w", err)
+	}
+	log.Debugf("cookie compressed: %d to %d\n", len(rawData), pool.buf.Len())
+	return pool.buf.Bytes(), nil
+}
+
+func (gz *gzipPoolCompressor) decompress(compData []byte) (raw []byte, err error) {
+	zr, err := gzip.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		return
+	}
+	if err = zr.Close(); err != nil {
+		return
+	}
+	return ioutil.ReadAll(zr)
+}
+
+func (zc *zlibCompressor) compress(rawData []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := zlib.NewWriterLevel(&buf, zc.compressionLevel)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to initiate compression of the cookie: %v", err)
+	}
+	_, err = zw.Write(rawData)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %v", err)
+	}
+	err = zw.Close()
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("cookie compressed: %d to %d\n", len(rawData), buf.Len())
+	return buf.Bytes(), nil
+}
+
+func (zc *zlibCompressor) decompress(compData []byte) ([]byte, error) {
+	zr, err := zlib.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		return nil, fmt.Errorf("Initiating the decompression of the cookie failed: %w", err)
+	}
+	err = zr.Close()
+	if err != nil {
+		return nil, err
+	}
+	return ioutil.ReadAll(zr)
+}
+func (zc *deflateCompressor) compress(rawData []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := flate.NewWriter(&buf, zc.compressionLevel)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to initiate compression of the cookie: %v", err)
+	}
+	_, err = zw.Write(rawData)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %v", err)
+	}
+	err = zw.Close()
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("cookie compressed: %d to %d\n", len(rawData), buf.Len())
+	return buf.Bytes(), nil
+}
+
+func (zc *deflateCompressor) decompress(compData []byte) ([]byte, error) {
+	zr := flate.NewReader(bytes.NewReader(compData))
+	err := zr.Close()
+	if err != nil {
+		return nil, err
+	}
+	return ioutil.ReadAll(zr)
+}
+
+func NewDeflatePoolCompressor(level int) *deflatePoolCompressor {
+	gz := &deflatePoolCompressor{compressionLevel: level}
+	gz.poolWriter = &sync.Pool{}
+	gz.poolWriter.New = func() interface{} {
+		w, err := flate.NewWriter(ioutil.Discard, level)
+		if err != nil {
+			log.Error(err)
+		}
+		return w
+	}
+	return gz
+}
+func (gz *deflatePoolCompressor) compress(rawData []byte) ([]byte, error) {
+	pw, ok := gz.poolWriter.Get().(*flate.Writer)
+	if !ok || pw == nil {
+		return nil, fmt.Errorf("could not get a gzip.Writer from the pool")
+	}
+	defer gz.poolWriter.Put(pw)
+	var buf bytes.Buffer
+	pw.Reset(&buf)
+	_, err := pw.Write(rawData)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %w", err)
+	}
+	err = pw.Close()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %w", err)
+	}
+	log.Debugf("cookie compressed: %d to %d\n", len(rawData), buf.Len())
+	return buf.Bytes(), nil
+}
+func (zc *deflatePoolCompressor) decompress(compData []byte) ([]byte, error) {
+	zr := flate.NewReader(bytes.NewReader(compData))
+	err := zr.Close()
+	if err != nil {
+		return nil, err
+	}
+	return ioutil.ReadAll(zr)
+}
+
+func (zc *lzwCompressor) compress(rawData []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := lzw.NewWriter(&buf, zc.order, 8)
+
+	_, err := zw.Write(rawData)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to compress cookie: %v", err)
+	}
+	err = zw.Close()
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("cookie compressed: %d to %d\n", len(rawData), buf.Len())
+	return buf.Bytes(), nil
+}
+
+func (zc *lzwCompressor) decompress(compData []byte) ([]byte, error) {
+	zr := lzw.NewReader(bytes.NewReader(compData), zc.order, 8)
+	return ioutil.ReadAll(zr)
+}
 
 // NewOAuthOidcUserInfos creates filter spec which tests user info.
 func NewOAuthOidcUserInfos(secretsFile string, secretsRegistry *secrets.Registry) filters.Spec {
@@ -150,6 +384,7 @@ func (s *tokenOidcSpec) CreateFilter(args []interface{}) (filters.Filter, error)
 		validity:   1 * time.Hour,
 		cookiename: generatedCookieName,
 		encrypter:  encrypter,
+		compressor: &zlibCompressor{compressionLevel: zlib.BestCompression},
 	}
 
 	// user defined scopes
@@ -418,17 +653,22 @@ func (f *tokenOidcFilter) validateCookie(cookie *http.Cookie) ([]byte, bool) {
 		return nil, false
 	}
 	log.Debugf("validate cookie name: %s", f.cookiename)
-	cookieStr, err := base64.StdEncoding.DecodeString(cookie.Value)
+	decodedCookie, err := base64.StdEncoding.DecodeString(cookie.Value)
 	if err != nil {
 		log.Debugf("Base64 decoding the cookie failed: %v", err)
 		return nil, false
 	}
-	decryptedCookie, err := f.encrypter.Decrypt(cookieStr)
+	decryptedCookie, err := f.encrypter.Decrypt(decodedCookie)
 	if err != nil {
 		log.Debugf("Decrypting the cookie failed: %v", err)
 		return nil, false
 	}
-	return []byte(decryptedCookie), true
+	decompressedCookie, err := f.compressor.decompress(decryptedCookie)
+	if err != nil {
+		log.Error(err)
+		return nil, false
+	}
+	return decompressedCookie, true
 }
 
 func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
@@ -579,7 +819,11 @@ func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
 				}
 			}
 
-			encryptedData, err := f.encrypter.Encrypt(data)
+			compressedData, err := f.compressor.compress(data)
+			if err != nil {
+				log.Error(err)
+			}
+			encryptedData, err := f.encrypter.Encrypt(compressedData)
 			if err != nil {
 				log.Errorf("Failed to encrypt the returned oidc data: %v.", err)
 				unauthorized(
